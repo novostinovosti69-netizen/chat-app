@@ -1,0 +1,90 @@
+// FastChat backend: Google Apps Script + Google Sheet (koi Firebase nahi chahiye)
+const N_MSG = 600;
+const ADMIN_EMAIL = 'mpdsangi@gmail.com'; // is email se signup karne wala admin banta hai
+const isAdmin_ = u => String(u.email).toLowerCase() === ADMIN_EMAIL;
+function doGet() { return ContentService.createTextOutput('FastChat server OK'); }
+function doPost(e) {
+  let out;
+  try { const b = JSON.parse(e.postData.contents); out = api(b.a, b.d); }
+  catch (err) { out = { err: 'server', msg: String(err) }; }
+  return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
+}
+let SS_ = null;
+function ss_() { // sheet se bound ho ya standalone script, dono mein chalta hai
+  if (SS_) return SS_;
+  const p = PropertiesService.getScriptProperties(), id = p.getProperty('SSID');
+  if (id) { try { SS_ = SpreadsheetApp.openById(id); return SS_; } catch (e) {} }
+  SS_ = SpreadsheetApp.getActiveSpreadsheet() || SpreadsheetApp.create('FastChat Data');
+  p.setProperty('SSID', SS_.getId()); return SS_;
+}
+function sh_(n, h) { const ss = ss_(); let s = ss.getSheetByName(n);
+  if (!s) { s = ss.insertSheet(n); s.appendRow(h); } return s; }
+const U_ = () => sh_('Users', ['id','name','email','hash','salt','token','lastSeen']);
+const M_ = () => sh_('Messages', ['id','chat','from','text','time','seen']);
+const hash_ = (p, salt) => Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, salt + p));
+const chat_ = (a, b) => [a, b].sort().join('__');
+const safe_ = t => { t = String(t || '').trim(); return /^[=+\-@]/.test(t) ? '\u200b' + t : t; };
+
+function api(a, d) {
+  d = d || {};
+  if (a === 'signup') return withLock_(() => signup_(d));
+  if (a === 'login') return login_(d);
+  const u = auth_(d.token); if (!u) return { err: 'auth' };
+  if (a === 'poll') return poll_(u, d);
+  if (a === 'send') return withLock_(() => send_(u, d));
+  if (a === 'adduser') return withLock_(() => add_(u, d));
+  if (a === 'deluser') return withLock_(() => del_(u, d));
+  return { err: 'bad' };
+}
+function withLock_(f) { const l = LockService.getScriptLock(); l.waitLock(20000); try { return f(); } finally { l.releaseLock(); } }
+function users_() { const s = U_(), n = s.getLastRow(); if (n < 2) return [];
+  return s.getRange(2, 1, n - 1, 7).getValues().map((r, i) => ({ row: i + 2, id: r[0], name: r[1], email: r[2], hash: r[3], salt: r[4], token: r[5], seen: r[6] })); }
+function msgs_() { const s = M_(), n = s.getLastRow(); if (n < 2) return [];
+  const st = Math.max(2, n - N_MSG + 1);
+  return s.getRange(st, 1, n - st + 1, 6).getValues().map((r, i) => ({ row: st + i, id: r[0], chat: r[1], from: r[2], text: String(r[3]), time: r[4], seen: r[5] })); }
+function auth_(t) { if (!t) return null; return users_().find(u => u.token === t) || null; }
+function signup_(d) {
+  const name = safe_(d.name).slice(0, 40), email = String(d.email || '').trim().toLowerCase(), pass = String(d.pass || '');
+  if (!name || !/^\S+@\S+\.\S+$/.test(email) || pass.length < 6) return { err: 'invalid' };
+  if (users_().some(u => u.email === email)) return { err: 'exists' };
+  const id = Utilities.getUuid(), salt = Utilities.getUuid(), token = Utilities.getUuid();
+  U_().appendRow([id, name, email, hash_(pass, salt), salt, token, Date.now()]);
+  return { token, id, name, admin: email === ADMIN_EMAIL ? 1 : 0 };
+}
+function login_(d) {
+  const email = String(d.email || '').trim().toLowerCase(), u = users_().find(x => x.email === email);
+  if (!u || hash_(String(d.pass || ''), u.salt) !== u.hash) return { err: 'badlogin' };
+  const token = Utilities.getUuid(); U_().getRange(u.row, 6).setValue(token);
+  return { token, id: u.id, name: u.name, admin: isAdmin_(u) ? 1 : 0 };
+}
+function poll_(u, d) {
+  const now = Date.now();
+  if (now - (+u.seen || 0) > 10000) U_().getRange(u.row, 7).setValue(now);
+  const us = users_(), rows = msgs_(), last = {};
+  rows.forEach(m => { last[m.chat] = m; });
+  const list = us.filter(x => x.id !== u.id).map(x => { const m = last[chat_(u.id, x.id)];
+    return { id: x.id, name: x.name, seen: x.seen, last: m ? { me: m.from === u.id ? 1 : 0, x: m.text.slice(0, 80), t: m.time, s: m.seen ? 1 : 0 } : null }; });
+  let msgs = [];
+  if (d.peer) {
+    const mine = rows.filter(m => m.chat === chat_(u.id, d.peer));
+    const un = mine.filter(m => m.from !== u.id && !m.seen);
+    if (un.length) { const s = M_(); un.forEach(m => { s.getRange(m.row, 6).setValue(1); m.seen = 1; }); }
+    msgs = mine.slice(-150).map(m => ({ me: m.from === u.id ? 1 : 0, x: m.text, t: m.time, s: m.seen ? 1 : 0, id: m.id }));
+  }
+  return { now, list, msgs, admin: isAdmin_(u) ? 1 : 0 };
+}
+function add_(u, d) {
+  if (!isAdmin_(u)) return { err: 'denied' };
+  const r = signup_(d); return r.err ? r : { ok: 1, name: r.name };
+}
+function del_(u, d) {
+  if (!isAdmin_(u) || d.id === u.id) return { err: 'denied' };
+  const t = users_().find(x => x.id === d.id); if (!t) return { err: 'invalid' };
+  U_().deleteRow(t.row); return { ok: 1 };
+}
+function send_(u, d) {
+  const text = safe_(d.text).slice(0, 2000);
+  if (!text || !users_().some(x => x.id === d.peer)) return { err: 'invalid' };
+  M_().appendRow([Utilities.getUuid(), chat_(u.id, d.peer), u.id, text, Date.now(), 0]);
+  return { ok: 1 };
+}
